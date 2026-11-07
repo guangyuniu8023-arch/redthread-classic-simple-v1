@@ -65,6 +65,23 @@ def read_config(path):
     return validate_config(data, base_dir)
 
 
+def read_config_json(text):
+    """Parse an inline JSON brief as data; resolve image paths from the cwd."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise RenderError('INVALID_CONFIG', str(exc), 'Pass a valid JSON object to --config-json.') from exc
+    return validate_config(data, Path.cwd())
+
+
+def artifact_relative_path(path):
+    """Return a cwd-relative POSIX path, or None for a file outside the cwd."""
+    try:
+        return Path(path).resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return None
+
+
 def validate_config(data, base_dir):
     if not isinstance(data, dict):
         raise RenderError('INVALID_CONFIG', 'The brief must be a JSON object.')
@@ -581,7 +598,9 @@ def render(config, out, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', required=True, help='JSON brief path, or - to read JSON from stdin')
+    config_input = parser.add_mutually_exclusive_group(required=True)
+    config_input.add_argument('--config', help='JSON brief path, or - to read JSON from stdin')
+    config_input.add_argument('--config-json', help='JSON brief as one argument; relative image paths use the current directory')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     out = args.out.expanduser().resolve()
@@ -590,7 +609,7 @@ def main():
     (out / 'outputs' / 'final.png').unlink(missing_ok=True)
     (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     try:
-        config = read_config(args.config)
+        config = read_config_json(args.config_json) if args.config_json is not None else read_config(args.config)
         report['seed'] = config['seed']
         brief_path = out / 'work' / 'brief.json'
         brief_path.parent.mkdir(parents=True, exist_ok=True)
@@ -619,6 +638,7 @@ def main():
         },
         'artifact': {
             'type': 'image', 'path': str(final), 'mime_type': 'image/png',
+            'relative_path': artifact_relative_path(final),
             'width': report['canvas'][0], 'height': report['canvas'][1],
             'sha256': report['output_sha256'],
         },
