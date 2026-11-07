@@ -372,6 +372,7 @@ def _choose_safe_candidate(
     seed: int,
     spreads: tuple[float, ...],
     mirror_values: tuple[bool, ...],
+    reverse_values: tuple[bool, ...] = (False,),
 ) -> dict:
     if not templates or not spreads:
         raise ValueError("NO_SAFE_CONNECTOR: no connector candidates supplied")
@@ -392,14 +393,18 @@ def _choose_safe_candidate(
         normalized = normalize_template(sample_path(template["path"]))
         for spread in spreads:
             for mirrored in mirror_values:
-                points = map_to_anchors(normalized, start, end, spread, mirrored)
-                outside, collision = candidate_score(points, canvas, 0.0, protected, contact_radius)
-                if outside or collision:
-                    continue
-                tie_break = random.Random(f"{seed}:{template['id']}:{int(mirrored)}").random()
-                candidates.append((abs(spread - 1.0), tie_break, template, mirrored, spread, points))
-    candidates.sort(key=lambda item: item[:2])
-    for _, _, template, mirrored, spread, points in candidates:
+                for reverse in reverse_values:
+                    # A connector has no arrow. Reusing the authored curve from
+                    # the other end adds an orientation, not a new spline.
+                    points = (list(reversed(map_to_anchors(normalized, end, start, spread, mirrored)))
+                              if reverse else map_to_anchors(normalized, start, end, spread, mirrored))
+                    outside, collision = candidate_score(points, canvas, 0.0, protected, contact_radius)
+                    if outside or collision:
+                        continue
+                    tie_break = random.Random(f"{seed}:{template['id']}:{int(mirrored)}").random()
+                    candidates.append((abs(spread - 1.0), reverse, tie_break, template, mirrored, spread, points))
+    candidates.sort(key=lambda item: item[:3])
+    for _, reverse, _, template, mirrored, spread, points in candidates:
         texture_seed = random.Random(f"texture:{seed}:{template['id']}").randrange(2**31)
         outside, collision = _stroke_audit(points, canvas, stroke_width, effective, texture_seed)
         if outside or collision:
@@ -407,6 +412,7 @@ def _choose_safe_candidate(
         return {
             "template": template,
             "mirrored": mirrored,
+            "reversed": reverse,
             "spread": spread,
             "points": points,
             "contact_radius": contact_radius,
@@ -432,7 +438,7 @@ def choose_safe_candidate(
     ``protected`` is the original L mask, not a pre-dilated mask. Render the
     selected points at supersample=6 using the returned ``texture_seed``.
     """
-    return _choose_safe_candidate(templates, start, end, canvas, stroke_width, protected, seed, spreads, (False, True))
+    return _choose_safe_candidate(templates, start, end, canvas, stroke_width, protected, seed, spreads, (False, True), (False, True))
 
 
 def choose_candidate(

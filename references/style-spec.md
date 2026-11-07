@@ -1,73 +1,58 @@
-# Style specification
+# 视觉要求
 
-## Canvas and subject
+本规范保留原 Redthread 设计。固定脚本减少执行时的选择，不放宽视觉门槛。
 
-- Use the fixed 1200×1600 canvas with a clean 50/50 horizontal split.
-- Build one canonical transparent subject from the source photo.
-- Preserve identity, expression, pose, scale, hand shape, clothing, accessories, and props.
-- Reuse the exact RGBA subject and alpha contour for both appearances.
-- Keep the upper copy at the source-relative position when practical.
-- Reposition the lower copy by translation only; never resize it independently.
+## 画布与主体
 
-## Upper panel
+- 画布固定为 1200×1600，横向中线将其分成两个 1200×800 面板。
+- 从原照片和对齐遮罩得到一个标准 RGBA 主体层。上下复用相同像素、alpha 轮廓和缩放比例。
+- 保留身份、表情、姿势、手型、头发、衣物、饰品、相关道具和有意义的运动模糊。
+- 程序根据主体位置选择合法裁切。上方保留原图中的主体与环境关系；下方只做横向和纵向平移，不能独立缩放或变形。
+- 原图已经截断的边缘不由程序补造；不能新增对可见主体、手或道具的裁断。
+- 几何检查包含所有非零 alpha，不删除半透明道具来强行放入面板。已有源图切口在下方仍贴相应画布边缘，不能变成悬空直切口。
+- 若完整主体与原环境无法同时填满面板，报告几何冲突。不得加黑边、镜像边缘、模糊铺底、生成背景或拉伸照片来冒充相同效果。
 
-- Retain the original environment and perspective.
-- Convert the canonical subject to warm cream white without changing its alpha.
-- Add a soft temperature-aware glow outside the contour.
-- Keep the silhouette mostly solid while retaining faint hand or prop detail only when it improves recognition.
+## 上方
 
-## Lower panel
+- 使用原照片环境，保留透视。
+- 将标准主体的 RGB 改为白色、暖白或奶油白，alpha 不变。
+- 根据原图光线温度选择白色和轮廓外柔和光晕。
+- 剪影以实心为主。仅在有助于辨认时保留很淡的手或道具细节。
 
-- Use `assets/paper/theme-fiber-paper.jpg` as the entire background.
-- Center-cover-crop it to the panel without stretching.
-- Recolor its average color to a softened source-derived theme while preserving fibers, short dark strands, pulp marks, scan softness, and local tonal variation.
-- Composite the real canonical subject above the recolored paper without changing identity or photographic texture.
-- Reserve useful negative space on both sides for Japanese.
+## 下方与配色
 
-## Palette
+- 全面板使用 `assets/paper/theme-fiber-paper.jpg`。居中等比裁切，不拉伸。
+- 从原图提取柔和主题色，改变纸纹平均颜色，同时保留纤维、短深色线、纸浆痕迹、扫描柔度和局部明暗。
+- 将真实主体置于纸纹上，保留原照片纹理。不得重建脸、衣物或道具。
+- 从主题色选择更深的复古红、棕红或砖红。全部文字和红线使用同一种强调色；不将所有照片固定成同一酒红色。
+- 两侧留出日文空间，主体大小由共同缩放决定，不能为下方排字单独缩小人物。
 
-Derive four roles from the source:
+## 文字
 
-1. Environment: retain the source scene in the upper panel.
-2. Theme: sample a muted representative source color for recoloring the fixed paper.
-3. Accent: use the fixed vintage wine red `#8F2634` to reduce agent choices.
-4. Glow: use the fixed warm cream-white treatment.
+- 根据本图的时间、地点、动作、道具和情绪写 3–4 条英文短语，每条宜 2–5 个词。
+- 英文全部放在上方剪影内部。
+- 为下方写两条短日文，各放人物一侧。优先不用标点；必要时自然换成两行。
+- 所有文字使用 `assets/fonts/dartsfont/DartsFont-Regular.ttf`，渲染前检查字形覆盖。
+- 两侧日文必须同字号；空间允许时明显大于英文。不能只缩小一侧来塞入文字。
+- 较长且未换行的日文可自动断成 2–3 行，字句不变；视觉检查确认断行自然。已提供的换行保持原样。
+- 日文靠近轮廓，但不遮脸、眼、手、道具或红线。使用轻微相反旋转、不完全对称的位置和克制的手写扰动。
+- 不用图片模型生成字母或文字，不复用与本图无关的示例短句。
 
-Use the same accent for all lettering and the connector.
+## 红线
 
-## Text
+- 使用 `assets/connectors/templates.json` 中原有路径，由包内 `scripts/render_connector.py` 绘制。正常任务不单独调用此辅助脚本。
+- 可见小指时，在小指轮廓上选一个点。否则选手指、鞋尖、发梢、衣角或道具尖端等清楚的轮廓尖端；非人物主体也选主体轮廓尖端。
+- 同一个主体局部点映射为上下两个端点。端点必须实际接触该点，不能落在旁边空白处，也不能编造缺失的手指。
+- 线条连续，呈长而松散的游走，有 3–5 个清楚的卷曲。卷曲大小、方向、间距和笔压有所变化。
+- 保留原渲染器细、半干的彩铅笔触：轻微边缘纤维、不规则边缘和透出纸面的细粒。线条应与 DartsFont 协调。
+- 程序保护完整人物、道具和全部文字；只允许端点附近必要接触。检查整个笔触，不能只检查中心线。
+- 拒绝粗记号笔、完全不透明矢量线、喷枪模糊、虚线、弹簧、电话线、重复圆圈、规则 S 曲线和笔直竖线。
+- 不用生图、Pillow 基本形状、正弦波、随机点或新编样条替换原模板。
 
-- Generate three or four English fragments of two to five words from the scene's time, place, action, prop, and emotion.
-- Place all English entirely inside the upper silhouette.
-- Generate two short Japanese thoughts, one on each side of the lower subject.
-- Prefer no punctuation.
-- Give both Japanese fragments exactly the same font size and make them visibly larger than English when space allows.
-- Move Japanese close to the subject contour without touching the face, hands, held prop, or connector.
-- Use natural two-line breaks instead of shrinking one Japanese side independently.
-- Use small opposing rotations and asymmetric placement.
+## 检查与交付
 
-## Connector
-
-- Use one uninterrupted line rendered from `assets/connectors/templates.json` by `scripts/render_connector.py` in the text accent color.
-- When the canonical subject contains a person and a little finger is clearly visible, connect the upper and lower copies at the exact corresponding subject-local point on that little finger.
-- If no little finger is identifiable, freely choose any clear pointed extremity on the subject contour, such as another fingertip, a shoe tip, a hair tip, a garment corner, or a held-prop tip. Do not invent missing geometry.
-- For a non-human subject, choose any clear contour tip on the main object.
-- In every case, transfer one selected subject-local point to both copies and make both endpoints visibly meet it rather than nearby empty space.
-- Prefer long loose meanders with three to five isolated curls.
-- Vary curl size, direction, spacing, and pressure.
-- Use the renderer's thin colored-pencil treatment: a semi-dry wine-red core, faint offset fibers, subtly irregular edges, and small translucent grain that lets the background show through.
-- Match the quiet hand-drawn character of the DartsFont lettering without copying glyph shapes or making the connector look fuzzy.
-- Keep the line readable at thumbnail size and away from the face and eyes.
-- The single-entry renderer selects a safe authored template and protects the complete subjects and all text. Do not call the internal renderer separately in normal use.
-- Do not generate or redraw the connector with an image model, Pillow primitives, a sine wave, random points, or a newly invented spline.
-- Reject thick marker strokes, fully opaque solid vectors, airbrush softness, broken dotted lines, springs, telephone cords, stacked circles, repeated loops, small attached blobs, regular S-curves, and straight vertical spines.
-
-## Final output
-
-- Treat the assembled composition as the final image; do not create an approval proof followed by a separate filter pass.
-- Preserve the fixed paper's visible texture. Do not cover it with synthetic paper grain or replace it with a flat color.
-- Keep the real lower subject naturally integrated with the theme color without rebuilding the face or clothing.
-- Make one sandbox invocation after inspecting the source. The renderer performs automatic checks and returns the final artifact plus a compact summary. If the host includes the final image in that same response, inspect it there. Do not make a separate preview or report-reading call. If no image is visible to the agent, deliver the generated PNG with automatic-check results and explicitly state that visual review was not performed.
-- Keep the subject cutout, masks, connector asset, component layers, and QA thumbnail internal. Do not preview, attach, link, or place them in the user-facing output directory unless the user explicitly asks for a specific intermediate.
-
-At thumbnail size, the person, two-panel structure, wine-red graphic system, Japanese side placement, and paper texture must remain immediately readable.
+- 合成后的图片就是最终作品，不安排“先确认再加滤镜”。
+- 程序检查通过后，Agent 私下查看全尺寸成图和约 400 px 宽的效果。缩略图中仍须看清人物、双层结构、深红图形、两侧日文和纸纹。
+- 程序不能代替对分割质量、文案、锚点语义和整体平衡的视觉判断。
+- 仅发布通过检查的最终 PNG。没有成图可看或视觉检查失败时，不宣称合格，不发布缺陷图。
+- 遮罩、标准主体、红线、组件图层和检查缩略图保留在 `work/` 内部，不放入用户成图目录，也不单独展示或链接。

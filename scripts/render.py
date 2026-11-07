@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -25,6 +26,7 @@ except ImportError:
 import check_font_glyphs as glyphs
 import recolor_theme_paper as paper
 import render_connector as connector
+from palette import derive_palette
 
 ROOT = Path(__file__).resolve().parents[1]
 FONT = ROOT / 'assets/fonts/dartsfont/DartsFont-Regular.ttf'
@@ -36,8 +38,9 @@ ACCENT = '#8F2634'
 
 
 class RenderError(ValueError):
-    def __init__(self, code, message, remedy=''):
+    def __init__(self, code, message, remedy='', details=None):
         self.code, self.message, self.remedy = code, message, remedy
+        self.details = details or {}
         super().__init__(f'{code}: {message}' + (f' {remedy}' if remedy else ''))
 
 
@@ -311,31 +314,62 @@ def get_mask(config, source, work):
     return mask, {'method': 'apple-vision-single-instance', **metadata, 'sha256': sha256(maskfile)}
 
 
-def prepare_subject(source, mask):
+def framing_candidates(source, mask):
+    """Legal cover crops only: never pad, stretch, redraw or newly cut the subject."""
     if source.size != mask.size:
         raise RenderError('MASK_SIZE', f'Mask {mask.size} does not match oriented source {source.size}.', 'Create a mask from the EXIF-oriented source, at the same pixel dimensions.')
     if mask.getbbox() is None or mask.getextrema()[1] < 128:
         raise RenderError('EMPTY_MASK', 'The mask does not contain a foreground subject.')
     scale = max(PANEL[0] / source.width, PANEL[1] / source.height)
     resized = (math.ceil(source.width * scale), math.ceil(source.height * scale))
-    left = (resized[0] - PANEL[0]) // 2
-    source_bbox = mask.point(lambda p: 255 if p >= 128 else 0).getbbox()
+    # Include translucent props and all supplied alpha. Do not erase low-alpha
+    # foreground as "noise" to force a composition to fit.
+    source_bbox = mask.getbbox()
     touches_bottom = source_bbox[3] >= source.height - 2
-    top = resized[1] - PANEL[1] if touches_bottom else (resized[1] - PANEL[1]) // 2
+    fit_scale = min(PANEL[0] / (source_bbox[2] - source_bbox[0]), PANEL[1] / (source_bbox[3] - source_bbox[1]))
+    geometry = {'source_size': list(source.size), 'subject_bbox': list(source_bbox),
+                'panel_size': list(PANEL), 'alpha_support': 'all nonzero source alpha', 'minimum_cover_scale': scale,
+                'maximum_subject_scale': fit_scale,
+                'subject_size_at_cover': [(source_bbox[2] - source_bbox[0]) * scale,
+                                          (source_bbox[3] - source_bbox[1]) * scale],
+                'background_size_at_subject_fit': [source.width * fit_scale, source.height * fit_scale]}
+    # Keep every thresholded foreground pixel; tolerate only floating-point noise.
+    bounds = []
+    for axis in (0, 1):
+        low = max(0, math.ceil(source_bbox[axis + 2] * scale - PANEL[axis] - 1e-8))
+        high = min(resized[axis] - PANEL[axis], math.floor(source_bbox[axis] * scale + 1e-8))
+        bounds.append((low, high))
+    if any(low > high for low, high in bounds):
+        raise RenderError('INPUT_COMPOSITION_UNSUPPORTED',
+                          'The complete subject and the original background cannot both fit the fixed 3:2 upper panel.',
+                          'Stop this render. Use a photo with more surrounding scene, or ask the user to change a design constraint. Do not add borders, extend the background, modify the mask or retry with smaller subjects.',
+                          geometry)
+    preferred = [(resized[0] - PANEL[0]) // 2,
+                 resized[1] - PANEL[1] if touches_bottom else (resized[1] - PANEL[1]) // 2]
+    axes = [list(dict.fromkeys((max(low, min(high, wanted)), low, high)))
+            for (low, high), wanted in zip(bounds, preferred)]
+    offsets = [(x, y) for x in axes[0] for y in axes[1]]
+    offsets.sort(key=lambda p: abs(p[0] - preferred[0]) + abs(p[1] - preferred[1]))
+    return [{'uniform_scale': scale, 'resized': list(resized), 'crop_offset': [x, y],
+             'bottom_aligned': touches_bottom and y == resized[1] - PANEL[1],
+             'geometry': geometry, 'crop_candidates': len(offsets),
+             'source_edges': [source_bbox[0] == 0, source_bbox[1] == 0,
+                              source_bbox[2] == source.width, source_bbox[3] == source.height]} for x, y in offsets]
+
+
+def prepare_subject(source, mask, framing=None):
+    framing = framing or framing_candidates(source, mask)[0]
+    scale, resized = framing['uniform_scale'], tuple(framing['resized'])
+    left, top = framing['crop_offset']
     crop = (left, top, left + PANEL[0], top + PANEL[1])
     photo = source.convert('RGB').resize(resized, Image.Resampling.LANCZOS).crop(crop).convert('RGBA')
     alpha = mask.resize(resized, Image.Resampling.LANCZOS).crop(crop)
     bbox = alpha.getbbox()
     if bbox is None or bbox[2] - bbox[0] < 90 or bbox[3] - bbox[1] < 180:
         raise RenderError('SUBJECT_TOO_SMALL', 'The subject is too small after the fixed panel crop.', 'Use a closer portrait with enough torso area for the English text.')
-    # Reject newly cut faces/heads at the top; a pre-existing image-edge cut remains explicit.
-    if source_bbox[1] * scale < top - 2:
-        raise RenderError('SUBJECT_CROPPED', 'The 3:2 upper panel would cut new content from the top of the subject.', 'Choose a wider photo or crop the source deliberately before running.')
-    if source_bbox[0] * scale < left - 2 or source_bbox[2] * scale > left + PANEL[0] + 2 or source_bbox[3] * scale > top + PANEL[1] + 2:
-        raise RenderError('SUBJECT_CROPPED', 'The fixed panel crop would cut new subject content at a side or bottom edge.', 'Choose a source composition that retains the selected subject inside the upper panel.')
     canonical = photo.crop(bbox)
     canonical.putalpha(alpha.crop(bbox))
-    return photo, alpha, canonical, bbox, {'uniform_scale': scale, 'resized': list(resized), 'crop_offset': [left, top], 'bottom_aligned': touches_bottom}
+    return photo, alpha, canonical, bbox, framing
 
 
 def contour_points(alpha):
@@ -369,7 +403,8 @@ def choose_anchor(alpha, bbox, supplied=None):
     return chosen, {'method': 'automatic-lower-contour-extreme', 'side': side, 'semantic_identity': 'unclassified contour tip; visually inspect'}
 
 
-def handtext(text, size, seed, angle=0):
+@lru_cache(maxsize=256)
+def handtext(text, size, seed, angle=0, accent=ACCENT):
     rng = random.Random(f'{seed}:{text}:{size}')
     font = ImageFont.truetype(str(FONT), size)
     advances = [font.getlength(c) + size * .10 for c in text]
@@ -377,7 +412,7 @@ def handtext(text, size, seed, angle=0):
     x = size
     for char, step in zip(text, advances):
         cell = Image.new('RGBA', (size * 3, size * 3))
-        ImageDraw.Draw(cell).text((size, size), char, font=font, fill=ACCENT, anchor='mm')
+        ImageDraw.Draw(cell).text((size, size), char, font=font, fill=accent, anchor='mm')
         cell = cell.rotate(rng.uniform(-2, 2), resample=Image.Resampling.BICUBIC)
         result.alpha_composite(cell, (int(x - size), int(size * .35 + rng.uniform(-1.3, 1.3))))
         x += step
@@ -387,11 +422,11 @@ def handtext(text, size, seed, angle=0):
     return result.crop(bounds).rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
 
 
-def english_layout(phrases, alpha, bbox, seed):
+def english_layout(phrases, alpha, bbox, seed, accent=ACCENT):
     interior = alpha.filter(ImageFilter.MinFilter(17))
     bh = bbox[3] - bbox[1]
     for size in (22, 20, 18):
-        images = [handtext(text, size, seed) for text in phrases]
+        images = [handtext(text, size, seed, accent=accent) for text in phrases]
         spacing = max(size * 2.5, bh * .10)
         for fraction in (.44, .50, .38, .56):
             first_y = int(bbox[1] + bh * fraction)
@@ -414,8 +449,24 @@ def english_layout(phrases, alpha, bbox, seed):
     raise RenderError('ENGLISH_DOES_NOT_FIT', 'English fragments do not fit inside the silhouette at 18–22 px.', 'Use shorter English phrases or a photo with a wider torso. Do not alter the subject.')
 
 
-def japanese_block(text, size, seed, angle):
-    rows = [handtext(line, size, seed) for line in text.splitlines() if line.strip()]
+def japanese_rows(text):
+    """Keep explicit breaks; wrap a long unbroken phrase without changing text."""
+    rows = [line for line in text.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) <= 5:
+        return rows
+    value = rows[0]
+    count = 2 if len(value) <= 8 else 3
+    rows = []
+    for remaining in range(count, 0, -1):
+        length = math.ceil(len(value) / remaining)
+        rows.append(value[:length])
+        value = value[length:]
+    return rows
+
+
+@lru_cache(maxsize=96)
+def japanese_block(text, size, seed, angle, accent=ACCENT):
+    rows = [handtext(line, size, seed, accent=accent) for line in japanese_rows(text)]
     width, height = max(im.width for im in rows), sum(im.height for im in rows) + 20 * (len(rows) - 1)
     result = Image.new('RGBA', (width, height))
     y = 0
@@ -425,7 +476,7 @@ def japanese_block(text, size, seed, angle):
     return result.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
 
 
-def japanese_layout(texts, size, lower_pos, canonical, seed, variant=0):
+def japanese_layout(texts, size, lower_pos, canonical, seed, variant=0, accent=ACCENT, avoid=None):
     lx, ly = lower_pos
     left, right = lx, lx + canonical.width
     margin, clearance = 40, 32
@@ -436,16 +487,19 @@ def japanese_layout(texts, size, lower_pos, canonical, seed, variant=0):
     center = lx + canonical.width / 2
     for index, text in enumerate(texts):
         angle = 3 if index == 0 else -3
-        im = japanese_block(text, size, seed, angle)
+        im = japanese_block(text, size, seed, angle, accent)
         cy = ly + canonical.height * fractions[index]
         preferred_y = max(835, min(1560 - im.height, round(cy - im.height / 2)))
-        # Use the actual contour at this height, not the full-body bounding box.
-        # If one side is narrow, try a nearby head-level or above-head position.
-        ys = [preferred_y, round(ly + canonical.height * .12), round(ly - im.height - 24)]
+        # Place both blocks beside the actual contour, never above the head as
+        # a shortcut for a lower subject pushed too far to one side.
+        ys = [preferred_y, round(ly + canonical.height * .12)]
         ys += [preferred_y + offset for offset in (-80, 80, -160, 160)]
+        if avoid is not None:
+            ys += sorted(range(max(835, ly + 16), min(1560, ly + canonical.height) - im.height + 1, 24),
+                         key=lambda y: abs(y - preferred_y))
         found = None
         for y in dict.fromkeys(ys):
-            if y < 835 or y + im.height > 1560:
+            if y < max(835, ly) or y + im.height > min(1560, ly + canonical.height):
                 continue
             occupied = body.crop((0, y - 16, CANVAS[0], y + im.height + 16)).getbbox()
             if index == 0:
@@ -456,7 +510,13 @@ def japanese_layout(texts, size, lower_pos, canonical, seed, variant=0):
                 high = CANVAS[0] - margin
             if high - low < im.width:
                 continue
-            x = round((low + high - im.width) / 2)
+            near = round(high - im.width if index == 0 else low)
+            xs = [near] if avoid is None else [near + (1 if index else -1) * gap for gap in (0, 32, 64, 96, 128)]
+            free_xs = [x for x in xs if low <= x and x + im.width <= high and
+                       (avoid is None or not avoid.crop((x - 8, y - 8, x + im.width + 9, y + im.height + 9)).getbbox())]
+            if not free_xs:
+                continue
+            x = free_xs[0]
             if (index == 0 and x + im.width / 2 >= center) or (index == 1 and x + im.width / 2 <= center):
                 continue
             if any(not (x + im.width + 16 <= px or px + previous.width + 16 <= x or
@@ -468,7 +528,7 @@ def japanese_layout(texts, size, lower_pos, canonical, seed, variant=0):
         if found is None:
             return None
         x, y = found
-        placements.append((im, (x, y), {'text': text, 'position': [x, y], 'font_size': size, 'rotation': angle, 'outside_subject_alpha': True, 'side': 'left' if index == 0 else 'right'}))
+        placements.append((im, (x, y), {'text': text, 'rendered_lines': japanese_rows(text), 'position': [x, y], 'font_size': size, 'rotation': angle, 'outside_subject_alpha': True, 'side': 'left' if index == 0 else 'right'}))
     return placements
 
 
@@ -482,37 +542,136 @@ def protect(alpha, canonical, lower_pos, texts):
     return mask
 
 
-def choose_layout(config, alpha, canonical, bbox, anchor, english, report):
+def lower_positions(bbox, canonical, source_edges=None):
+    """Translate the one canonical layer in 2D; keep source-edge cuts at the edge."""
+    edges = source_edges if source_edges is not None else [bbox[0] == 0, bbox[1] == 0, bbox[2] == PANEL[0], bbox[3] == PANEL[1]]
+    margin_x = min(24, (CANVAS[0] - canonical.width) // 2)
+    margin_y = min(24, (PANEL[1] - canonical.height) // 2)
+    x_min, x_max = margin_x, CANVAS[0] - canonical.width - margin_x
+    y_min = PANEL[1] if edges[1] else PANEL[1] + margin_y
+    y_max = CANVAS[1] - canonical.height - (0 if edges[3] else margin_y)
+    if edges[0]:
+        x_min = x_max = 0
+    if edges[2]:
+        x_min = x_max = CANVAS[0] - canonical.width
+    if edges[3]:
+        # An existing photo-edge cut (for example a waist) must not float above
+        # the paper's bottom edge. Complete subjects retain vertical freedom.
+        y_min = y_max
+    if edges[1]:
+        y_max = y_min
+    if x_min > x_max or y_min > y_max:
+        return []
+    def axis(low, high, preferred):
+        return list(dict.fromkeys((max(low, min(high, preferred)), round((low + high) / 2),
+                                   low, high, round(low * .75 + high * .25))))
+    xs = list(dict.fromkeys(max(x_min, min(x_max, x)) for x in
+                           (bbox[0], bbox[0] - 120, bbox[0] + 120,
+                            round((x_min + x_max) / 2), round(x_min * .75 + x_max * .25))))
+    ys = axis(y_min, y_max, bbox[1] + PANEL[1])
+    positions = [(x, y) for x in xs for y in ys]
+    positions.sort(key=lambda p: abs(p[0] - bbox[0]) + abs(p[1] - bbox[1] - PANEL[1]))
+    return positions
+
+
+def choose_layout(config, alpha, canonical, bbox, anchor, english, report, accent=ACCENT, source_edges=None):
     connector.load_python_image_backend()
     try:
         templates = connector.load_templates(TEMPLATES)
     except (OSError, TypeError, KeyError, AttributeError, ValueError) as exc:
         raise RenderError('ASSET_INVALID', f'The connector template library cannot be parsed: {exc}', 'Restore assets/connectors/templates.json from the original package.') from exc
     attempts = []
-    # At most 5 horizontal placements, 4 shared Japanese sizes and 3 text patterns.
-    # Source and canonical subject are never resized again.
-    offsets = (0, -120, 120, -240, 240)
-    positions = [(bbox[0] + dx, bbox[1] + PANEL[1]) for dx in offsets
-                 if 24 <= bbox[0] + dx and bbox[0] + dx + canonical.width <= CANVAS[0] - 24]
-    for size in (40, 36, 32, 28):
-        for lower in positions:
-            for variant in range(3):
-                japanese = japanese_layout(config['japanese'], size, lower, canonical, config['seed'], variant)
-                if japanese is None:
-                    continue
-                end = (anchor[0] + lower[0] - bbox[0], anchor[1] + PANEL[1])
-                protected = protect(alpha, canonical, lower, english + japanese)
+    routes_without_japanese = {}
+    local_routing_count = 0
+    # Each crop/anchor gets at most 96 routing attempts. The entire request has
+    # one shared budget, including candidates in other legal crops.
+    positions = lower_positions(bbox, canonical, source_edges)
+    # Search nearby placements first, but give every font size a turn before
+    # spending the routing budget on distant positions.
+    trials = ((size, lower, variant)
+              for start in range(0, len(positions), 4)
+              for size in (40, 36, 32, 28)
+              for lower in positions[start:start + 4]
+              for variant in range(3))
+    for size, lower, variant in trials:
+        japanese = japanese_layout(config['japanese'], size, lower, canonical, config['seed'], variant, accent)
+        if japanese is None:
+            continue
+        if local_routing_count >= 96 or report.get('routing_attempt_count', 0) >= 288:
+            report.setdefault('layout_attempts', []).extend(attempts)
+            raise RenderError('NO_SAFE_LAYOUT', 'The bounded layout search did not find a safe original-template route.',
+                              'Stop this render. Report the constraint; do not modify the source, mask, templates or random seed.')
+        report['routing_attempt_count'] = report.get('routing_attempt_count', 0) + 1
+        local_routing_count += 1
+        end = (anchor[0] + lower[0] - bbox[0], anchor[1] + lower[1] - bbox[1])
+        protected = protect(alpha, canonical, lower, english + japanese)
+        try:
+            candidate = connector.choose_safe_candidate(templates, anchor, end, CANVAS, 6.24, protected, config['seed'])
+            attempts.append({'lower_position': list(lower), 'japanese_font_size': size, 'variant': variant, 'result': 'passed'})
+            report.setdefault('layout_attempts', []).extend(attempts)
+            return lower, japanese, protected, end, candidate
+        except ValueError as exc:
+            if not str(exc).startswith('NO_SAFE_CONNECTOR'):
+                raise
+            attempts.append({'lower_position': list(lower), 'japanese_font_size': size, 'variant': variant, 'result': 'no-safe-connector'})
+        # Try the inverse order too: pick a body-safe authored route,
+        # then move text along the contour to avoid its actual pixels.
+        # This is an internal joint search, not another Agent command.
+        if lower not in routes_without_japanese:
+            routes_without_japanese[lower] = None
+            if local_routing_count < 96 and report.get('routing_attempt_count', 0) < 288:
+                local_routing_count += 1
+                report['routing_attempt_count'] = report.get('routing_attempt_count', 0) + 1
                 try:
-                    candidate = connector.choose_safe_candidate(templates, anchor, end, CANVAS, 6.24, protected, config['seed'])
-                    attempts.append({'lower_position': list(lower), 'japanese_font_size': size, 'variant': variant, 'result': 'passed'})
-                    report['layout_attempts'] = attempts
-                    return lower, japanese, protected, end, candidate
+                    body_mask = protect(alpha, canonical, lower, english)
+                    route = connector.choose_safe_candidate(templates, anchor, end, CANVAS, 6.24, body_mask, config['seed'])
+                    stroke = connector.render_mask(route['points'], CANVAS, 6.24, 6, route['texture_seed'], .58)
+                    routes_without_japanese[lower] = route, stroke
                 except ValueError as exc:
                     if not str(exc).startswith('NO_SAFE_CONNECTOR'):
                         raise
-                    attempts.append({'lower_position': list(lower), 'japanese_font_size': size, 'variant': variant, 'result': 'no-safe-connector'})
-    report['layout_attempts'] = attempts
-    raise RenderError('NO_SAFE_LAYOUT', 'No bounded layout satisfied subject, lettering, border and connector protection.', 'Use shorter Japanese lines, choose a clear outer contour anchor, or choose a less crowded source photo. Changing random seeds is not a reliable fix.')
+        saved_route = routes_without_japanese[lower]
+        if saved_route is not None:
+            route, stroke = saved_route
+            moved_text = japanese_layout(config['japanese'], size, lower, canonical, config['seed'], variant, accent, avoid=stroke)
+            if moved_text is not None:
+                final_mask = protect(alpha, canonical, lower, english + moved_text)
+                if connector.validate_rendered_mask(stroke, final_mask, anchor, end, route['contact_radius']) == 0:
+                    attempts.append({'lower_position': list(lower), 'japanese_font_size': size, 'variant': variant, 'result': 'passed-route-then-text'})
+                    report.setdefault('layout_attempts', []).extend(attempts)
+                    return lower, moved_text, final_mask, end, route
+    report.setdefault('layout_attempts', []).extend(attempts)
+    raise RenderError('NO_SAFE_LAYOUT', 'No bounded layout satisfied subject, lettering, border and connector protection.',
+                      'Stop this render. Report the constraint without retries, source padding or mask changes.')
+
+
+def solve_composition(config, source, mask, report, accent):
+    frames = framing_candidates(source, mask)
+    report['framing_attempts'] = []
+    last_error = None
+    for frame in frames:
+        photo, alpha, canonical, bbox, transform = prepare_subject(source, mask, frame)
+        supplied = None
+        if 'anchor' in config:
+            supplied = tuple(min(source.size[i] - 1, config['anchor'][i] * source.size[i]) *
+                             transform['uniform_scale'] - transform['crop_offset'][i] for i in (0, 1))
+        try:
+            anchor, anchor_record = choose_anchor(alpha, bbox, supplied)
+            if supplied is not None:
+                anchor_record.update({'requested_source_normalized': config['anchor'],
+                                      'requested_panel_point': list(supplied)})
+            english = english_layout(config['english'], alpha, bbox, config['seed'], accent)
+            lower, japanese, protected, end, candidate = choose_layout(config, alpha, canonical, bbox, anchor, english, report, accent, frame['source_edges'])
+            report['framing_attempts'].append({'crop_offset': frame['crop_offset'], 'result': 'passed'})
+            return photo, alpha, canonical, bbox, transform, anchor, anchor_record, english, lower, japanese, protected, end, candidate
+        except RenderError as exc:
+            if exc.code not in ('ENGLISH_DOES_NOT_FIT', 'NO_SAFE_LAYOUT', 'ANCHOR_UNAVAILABLE'):
+                raise
+            last_error = exc
+            report['framing_attempts'].append({'crop_offset': frame['crop_offset'], 'result': exc.code})
+            if report.get('routing_attempt_count', 0) >= 288:
+                break
+    raise last_error
 
 
 def render(config, out, report):
@@ -537,40 +696,27 @@ def render(config, out, report):
     mask, segmentation = get_mask(config, source, work)
     report['segmentation'] = segmentation
     mask.save(work / 'source-mask.png')
-    photo, alpha, canonical, bbox, transform = prepare_subject(source, mask)
+    palette = derive_palette(source, mask, config.get('theme'))
+    report['palette'] = palette
+    photo, alpha, canonical, bbox, transform, anchor, anchor_record, english, lower, japanese, protected, end, candidate = solve_composition(config, source, mask, report, palette['accent'])
     photo.save(work / 'upper-photo.png')
     canonical.save(work / 'canonical-subject.png')
     alpha.save(work / 'upper-alpha.png')
     report['transform'] = transform
     report['canonical'] = {'bbox': list(bbox), 'sha256': sha256(work / 'canonical-subject.png'), 'alpha_sha256': hashlib.sha256(canonical.getchannel('A').tobytes()).hexdigest(), 'created_once': True}
-    supplied = None
-    if 'anchor' in config:
-        supplied = (min(source.width - 1, config['anchor'][0] * source.width) * transform['uniform_scale'] - transform['crop_offset'][0], min(source.height - 1, config['anchor'][1] * source.height) * transform['uniform_scale'] - transform['crop_offset'][1])
-    anchor, anchor_record = choose_anchor(alpha, bbox, supplied)
-    if supplied is not None:
-        anchor_record['requested_source_normalized'] = config['anchor']
-        anchor_record['requested_panel_point'] = list(supplied)
-    english = english_layout(config['english'], alpha, bbox, config['seed'])
-    lower, japanese, protected, end, candidate = choose_layout(config, alpha, canonical, bbox, anchor, english, report)
     report['anchor'] = {**anchor_record, 'upper': list(anchor), 'lower': list(end), 'source_normalized': [(anchor[0] + transform['crop_offset'][0]) / transform['uniform_scale'] / source.width, (anchor[1] + transform['crop_offset'][1]) / transform['uniform_scale'] / source.height]}
-    if 'theme' in config:
-        color = paper.parse_color(config['theme'])
-        color_source = 'brief'
-    else:
-        mean = ImageStat.Stat(source.resize((64, 64)).convert('RGB')).mean
-        color = tuple(round(.35 * c + .65 * 211) for c in mean)
-        color_source = 'muted-source-average'
-    theme = '#%02X%02X%02X' % color
+    theme, color_source = palette['theme'], palette['metadata']['theme_source']
+    color = paper.parse_color(theme)
     paper.load_python_image_backend()
     texture = paper.recolor(paper.cover_crop(Image.open(PAPER), *PANEL), color)
     texture.save(work / 'paper.png')
     canvas = Image.new('RGBA', CANVAS)
     canvas.alpha_composite(photo, (0, 0))
     canvas.paste(texture, (0, PANEL[1]))
-    glow = Image.new('RGBA', PANEL, '#FFF7E8')
+    glow = Image.new('RGBA', PANEL, palette['glow'])
     glow.putalpha(alpha.filter(ImageFilter.GaussianBlur(10)).point(lambda p: round(p * .4)))
     canvas.alpha_composite(glow, (0, 0))
-    cream = Image.new('RGBA', canonical.size, '#FFF9EC')
+    cream = Image.new('RGBA', canonical.size, palette['silhouette'])
     cream.putalpha(canonical.getchannel('A'))
     cream.save(work / 'upper-subject.png')
     canonical.save(work / 'lower-subject.png')
@@ -586,13 +732,13 @@ def render(config, out, report):
     collisions = connector.validate_rendered_mask(stroke_alpha, protected, anchor, end, candidate['contact_radius'])
     if collisions:
         raise RenderError('CONNECTOR_COLLISION', f'The complete rendered stroke overlaps {collisions} protected pixels.', 'Use another clear contour anchor or shorter copy.')
-    stroke = Image.new('RGBA', CANVAS, ACCENT)
+    stroke = Image.new('RGBA', CANVAS, palette['accent'])
     stroke.putalpha(stroke_alpha)
     stroke.save(work / 'connector.png')
     canvas.alpha_composite(stroke)
     canvas.convert('RGB').save(final)
     canvas.resize((400, 533), Image.Resampling.LANCZOS).convert('RGB').save(work / 'preview.jpg', quality=94)
-    report.update({'status': 'success', 'canvas': list(CANVAS), 'split_y': 800, 'theme': theme, 'theme_source': color_source, 'accent': ACCENT, 'upper_position': [bbox[0], bbox[1]], 'lower_position': list(lower), 'lower_scale_ratio': 1.0, 'alpha_reused_exactly': cream.getchannel('A').tobytes() == canonical.getchannel('A').tobytes(), 'lower_rgb_matches_canonical': lower_rgb_verified, 'lower_layer_rgba_matches_canonical': lower_rgba_verified, 'text': [record for _, _, record in english + japanese], 'connector': {'template': candidate['template']['id'], 'mirrored': candidate['mirrored'], 'spread': candidate['spread'], 'stroke_width': 6.24, 'contact_radius': candidate['contact_radius'], 'texture_seed': candidate['texture_seed'], 'collision_pixels': collisions, 'protection': 'complete upper and lower subject alpha plus padded text rectangles'}, 'output': str(final), 'output_sha256': sha256(final), 'visual_review_required': ['Chosen subject and props included by segmentation', 'Identity, anatomy and expression of source retained', 'Anchor refers to the intended visible tip; automatic choice is not semantic finger detection', 'English meaning and Japanese fluency', 'Overall editorial balance and stylistic similarity']})
+    report.update({'status': 'success', 'canvas': list(CANVAS), 'split_y': 800, 'theme': theme, 'theme_source': color_source, 'accent': palette['accent'], 'upper_position': [bbox[0], bbox[1]], 'lower_position': list(lower), 'lower_scale_ratio': 1.0, 'alpha_reused_exactly': cream.getchannel('A').tobytes() == canonical.getchannel('A').tobytes(), 'lower_rgb_matches_canonical': lower_rgb_verified, 'lower_layer_rgba_matches_canonical': lower_rgba_verified, 'text': [record for _, _, record in english + japanese], 'connector': {'template': candidate['template']['id'], 'mirrored': candidate['mirrored'], 'reversed': candidate.get('reversed', False), 'spread': candidate['spread'], 'stroke_width': 6.24, 'contact_radius': candidate['contact_radius'], 'texture_seed': candidate['texture_seed'], 'collision_pixels': collisions, 'protection': 'complete upper and lower subject alpha plus padded text rectangles'}, 'output': str(final), 'output_sha256': sha256(final), 'visual_review_required': ['Chosen subject and props included by segmentation', 'Identity, anatomy and expression of source retained', 'Anchor refers to the intended visible tip; automatic choice is not semantic finger detection', 'English meaning and Japanese fluency', 'Overall editorial balance and stylistic similarity']})
     return final
 
 
@@ -618,7 +764,7 @@ def main():
         final = render(config, out, report)
     except (RenderError, OSError, ValueError) as exc:
         (out / 'outputs' / 'final.png').unlink(missing_ok=True)
-        report['error'] = {'code': getattr(exc, 'code', 'RENDER_FAILED'), 'message': getattr(exc, 'message', str(exc)), 'remedy': getattr(exc, 'remedy', 'Check the supplied images and brief.')}
+        report['error'] = {'code': getattr(exc, 'code', 'RENDER_FAILED'), 'message': getattr(exc, 'message', str(exc)), 'remedy': getattr(exc, 'remedy', 'Check the supplied images and brief.'), 'details': getattr(exc, 'details', {})}
         (out / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         print(str(exc), file=sys.stderr)
         print(f'Report: {out / "report.json"}', file=sys.stderr)
@@ -629,6 +775,13 @@ def main():
         'status': 'success', 'output': str(final), 'report': str(out / 'report.json'),
         'brief': report['brief'],
         'segmentation': report.get('segmentation'),
+        'composition': {
+            'crop_offset': report.get('transform', {}).get('crop_offset'),
+            'lower_position': report.get('lower_position'),
+            'framing_attempts': len(report.get('framing_attempts', [])),
+            'routing_attempts': report.get('routing_attempt_count', 0),
+            'routing_attempt_limit': 288,
+        },
         'checks': {
             'glyph_coverage': report['glyph_coverage'],
             'alpha_reused_exactly': report['alpha_reused_exactly'],
