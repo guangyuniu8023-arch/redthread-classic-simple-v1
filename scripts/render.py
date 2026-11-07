@@ -221,21 +221,55 @@ def check_glyphs(texts):
         raise RenderError('MISSING_GLYPHS', 'DartsFont does not contain: ' + ''.join(dict.fromkeys(missing)), 'Rewrite these characters using the original font’s supported letters or kana; do not substitute the font.')
 
 
+def supplied_mask(path, source_size):
+    try:
+        with Image.open(path) as original:
+            im = ImageOps.exif_transpose(original)
+            if im.size != source_size:
+                raise RenderError('MASK_SIZE', f'Mask {im.size} does not match oriented source {source_size}.',
+                                  'Ask the host segmentation tool for a full-size mask or transparent PNG. Do not crop, resize or guess its position.')
+            alpha = None
+            if im.mode in ('RGBA', 'LA'):
+                alpha = im.getchannel('A')
+            elif im.mode == 'P' and 'transparency' in im.info:
+                alpha = im.convert('RGBA').getchannel('A')
+            if alpha is not None and alpha.getextrema()[0] < 255:
+                # A host cutout contributes only alpha, never its modified RGB.
+                mask, channel = alpha, 'alpha'
+            elif im.mode in ('1', 'L', 'LA'):
+                mask, channel = im.convert('L'), 'grayscale'
+            elif im.mode in ('RGB', 'RGBA', 'P'):
+                red, green, blue = im.convert('RGB').split()
+                if ImageChops.difference(red, green).getbbox() or ImageChops.difference(red, blue).getbbox():
+                    raise RenderError('MASK_FORMAT', 'The supplied mask is a color image without usable transparency.',
+                                      'Use the host tool\'s full-size transparent cutout or a grayscale mask with white foreground. An opaque color photo is not a mask.')
+                mask, channel = red, 'grayscale'
+            else:
+                raise RenderError('MASK_FORMAT', f'Unsupported mask image mode: {im.mode}.',
+                                  'Supply an 8-bit grayscale mask or a full-size transparent PNG from the host segmentation tool.')
+    except OSError as exc:
+        raise RenderError('MASK_UNREADABLE', str(exc), 'Supply a readable grayscale mask or full-size transparent PNG.') from exc
+    extrema = mask.getextrema()
+    if extrema[1] < 128:
+        raise RenderError('EMPTY_MASK', 'The supplied mask or transparent cutout does not contain a foreground subject.')
+    if extrema == (255, 255):
+        raise RenderError('FULL_MASK', 'The supplied mask is entirely white.',
+                          'Use a subject mask with background pixels; a full image rectangle does not select a subject.')
+    return mask, channel
+
+
 def get_mask(config, source, work):
     if 'mask' in config:
-        try:
-            with Image.open(config['mask']) as im:
-                mask = im.convert('L')
-        except OSError as exc:
-            raise RenderError('MASK_UNREADABLE', str(exc), 'Supply a white-foreground grayscale PNG.') from exc
-        return mask, {'method': 'supplied-mask', 'sha256': sha256(config['mask']), 'subject_selection': 'caller-supplied; inspect mask visually'}
+        mask, channel = supplied_mask(config['mask'], source.size)
+        return mask, {'method': 'supplied-mask', 'sha256': sha256(config['mask']), 'mask_channel': channel, 'subject_selection': 'caller-supplied; inspect mask visually'}
     if 'segmentation' in config:
         return configured_mask(config, source, work)
     if platform.system() != 'Darwin':
-        raise RenderError('SEGMENTATION_NOT_CONFIGURED', 'No segmentation command has been configured for this renderer.',
-                          'Connect the sandbox\'s existing subject-segmentation interface through segmentation.command or REDTHREAD_SEGMENTATION, or provide mask. This does not establish that the sandbox lacks a segmentation model.')
+        raise RenderError('SEGMENTATION_NOT_CONFIGURED', 'This invocation has no supplied mask or configured local segmentation command.',
+                          'Use the host\'s existing subject-segmentation tool and pass its full-size grayscale mask or transparent PNG in mask. An existing command adapter is optional. This error does not establish that the sandbox lacks a segmentation model.')
     if not shutil.which('swift'):
-        raise RenderError('SWIFT_MISSING', 'The swift command is unavailable.', 'Provide a segmentation mask using the mask field, or install the Apple command-line tools.')
+        raise RenderError('SWIFT_MISSING', 'The built-in Apple Vision route cannot start because swift is unavailable.',
+                          'Use the host\'s existing subject-segmentation tool and pass its full-size grayscale mask or transparent PNG in mask. An existing command adapter is optional.')
     srcfile = work / 'normalized-source.png'
     source.save(srcfile)
     maskfile = work / 'source-mask.png'
