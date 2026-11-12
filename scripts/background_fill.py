@@ -47,10 +47,10 @@ def _valid_model(value):
 
 
 def validate_config(value: dict, base_dir: Path) -> dict:
-    allowed = {'provider', 'image', 'model', 'timeout', 'base_url', 'scene'}
+    allowed = {'provider', 'image', 'model', 'timeout', 'base_url', 'scene', 'prefer_side'}
     if not isinstance(value, dict) or set(value) - allowed:
         raise BackgroundError('INVALID_CONFIG',
-                              'background must contain only provider, image, model, timeout, base_url and scene.',
+                              'background must contain only provider, image, model, timeout, base_url, scene and prefer_side.',
                               'Keep API keys in ARK_API_KEY or SEEDREAM_API_KEY environment variables.')
     if value.get('provider', 'seedream') != 'seedream':
         raise BackgroundError('INVALID_CONFIG', 'background.provider must be seedream.')
@@ -61,6 +61,10 @@ def validate_config(value: dict, base_dir: Path) -> dict:
     if not isinstance(base_url, str) or base_url.rstrip('/') != BASE_URL:
         raise BackgroundError('INVALID_CONFIG', 'background.base_url must use the official Ark Beijing API URL.')
     result = {'provider': 'seedream', 'timeout': timeout}
+    if 'prefer_side' in value:
+        if not isinstance(value['prefer_side'], str) or value['prefer_side'] not in ('left', 'right'):
+            raise BackgroundError('INVALID_CONFIG', 'background.prefer_side must be left or right.')
+        result['prefer_side'] = value['prefer_side']
     if 'scene' in value:
         scene = value['scene']
         if not isinstance(scene, str) or not 1 <= len(scene) <= 400 or not scene.strip():

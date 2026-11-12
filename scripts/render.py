@@ -449,6 +449,11 @@ def framing_candidates(source, mask, head_box=None, protected_boxes=None, anchor
         point_box = [max(0, ax - 8 * _margin_fraction / raster_scale[0]), max(0, ay - 8 * _margin_fraction / raster_scale[1]),
                      min(source.width, ax + 8 * _margin_fraction / raster_scale[0]), min(source.height, ay + 8 * _margin_fraction / raster_scale[1])]
         required = point_box if required is None else union(required, point_box)
+    if required[1] > edge_bbox[1]:
+        # An underestimated annotation must not introduce a new top cut.
+        # This is read-only alpha evidence, not semantic head detection.
+        geometry['mask_top_guard'] = {'source_y': edge_bbox[1], 'previous_required_y': required[1]}
+        required = [required[0], edge_bbox[1], required[2], required[3]]
     geometry.update({'protected_boxes': protected_boxes or [], 'requested_anchor': anchor,
                      'required_region_source': required})
     if required is not None and (required[0] < 0 or required[1] < 0 or required[2] > source.width or
@@ -574,6 +579,8 @@ def fill_photo_background(config, photo, transform, canonical, work, report):
         metadata.update({'method': 'not-required', 'image_generation_used': False})
         report['image_generation_used'] = False
         return photo
+    if 'prefer_side' in config.get('background', {}):
+        metadata['requested_prefer_side'] = config['background']['prefer_side']
     import background_fill
     coverage.save(work / 'background-coverage.png')
     canonical_bytes = canonical.tobytes()
@@ -657,6 +664,29 @@ def anchor_candidates(alpha, bbox, supplied=None):
             seen.add(point)
             choices.append((point, {'method': 'automatic-contour-band-extreme', 'side': side,
                                      'height_fraction': fraction, 'semantic_identity': 'unclassified contour tip; visually inspect'}))
+    return choices
+
+
+def fallback_anchor_candidates(alpha, bbox):
+    """Return at most four real low contour tips, excluding panel cut edges."""
+    if alpha.getbbox() is None:
+        return []
+    points = contour_points(alpha)
+    height = bbox[3] - bbox[1]
+    choices, seen = [], set()
+    for low, high in ((.96, .975), (.975, .99)):
+        band = [p for p in points if bbox[1] + height * low <= p[1] < bbox[1] + height * high
+                and 18 <= p[0] < 1182 and 2 <= p[1] < 798]
+        if not band:
+            continue
+        for side in ('left', 'right'):
+            extreme = min(p[0] for p in band) if side == 'left' else max(p[0] for p in band)
+            point = max((p for p in band if abs(p[0] - extreme) <= 2), key=lambda p: p[1])
+            if point not in seen:
+                seen.add(point)
+                choices.append((point, {'method': 'automatic-low-contour-band-extreme', 'side': side,
+                                         'height_range': [low, high],
+                                         'semantic_identity': 'unclassified contour tip; visually inspect'}))
     return choices
 
 
@@ -893,7 +923,7 @@ def lower_positions(bbox, canonical, source_edges=None, head_check=None):
     return positions
 
 
-def choose_layout(config, alpha, canonical, bbox, anchor, english, report, accent=ACCENT, source_edges=None, head_check=None, allow_same_side=False, route_cache=None):
+def choose_layout(config, alpha, canonical, bbox, anchor, english, report, accent=ACCENT, source_edges=None, head_check=None, allow_same_side=False, route_cache=None, extended_budget=False):
     connector.load_python_image_backend()
     try:
         templates = connector.load_templates(TEMPLATES)
@@ -902,7 +932,7 @@ def choose_layout(config, alpha, canonical, bbox, anchor, english, report, accen
     attempts = []
     routes_without_japanese = {} if route_cache is None else route_cache
     local_routing_count = 0
-    routing_limit = min(96, report.get('routing_attempt_limit', 96))
+    routing_limit = min(128 if extended_budget else 96, report.get('routing_attempt_limit', 96))
     # Every crop, anchor and placement shares the same request-wide budget.
     positions = lower_positions(bbox, canonical, source_edges, head_check)
     # Exhaust lettering options at the source position before translating the
@@ -978,9 +1008,19 @@ def choose_layout(config, alpha, canonical, bbox, anchor, english, report, accen
 def solve_composition(config, source, mask, report, accent):
     frames = framing_candidates(source, mask, config.get('head_box'), config.get('protected_boxes'),
                                 config.get('anchor'), config.get('upper_body_box'))
+    prefer_side = config.get('background', {}).get('prefer_side')
+    if prefer_side is not None and frames[0]['layout_mode'] == 'background-fill':
+        def side_priority(frame):
+            left, right = frame['photo_rect'][0], PANEL[0] - frame['photo_rect'][2]
+            preferred, opposite = (left, right) if prefer_side == 'left' else (right, left)
+            return preferred == 0, opposite
+        # A soft preference only reorders existing legal frames; ties retain
+        # their authored order and all attempts share the existing route budget.
+        frames = sorted(frames, key=side_priority)
     report['framing_attempts'] = []
     report['routing_attempt_limit'] = 96
     last_error = None
+    had_route_failure = False
     deferred = []
     for frame in frames:
         supplied = None
@@ -1006,6 +1046,7 @@ def solve_composition(config, source, mask, report, accent):
                 except RenderError as exc:
                     if exc.code != 'NO_SAFE_LAYOUT':
                         raise
+                    had_route_failure = True
                     last_error = exc
                     if any(route is not None for route in route_cache.values()):
                         deferred.append((photo, alpha, canonical, bbox, transform, anchor, anchor_record,
@@ -1038,7 +1079,52 @@ def solve_composition(config, source, mask, report, accent):
             last_error = exc
             report.setdefault('anchor_attempts', []).append({'crop_offset': frame['crop_offset'], 'anchor': list(anchor),
                                                             'result': exc.code, 'japanese_layout_mode': 'same-side-staggered'})
+    if 'anchor' not in config and had_route_failure:
+        return _solve_low_contour_fallback(config, source, mask, frames, report, accent, last_error)
     raise last_error
+
+
+def _solve_low_contour_fallback(config, source, mask, frames, report, accent, last_error):
+    previous = report.get('routing_attempt_count', 0)
+    fallback = {'triggered': True, 'previous_stage_routing_attempts': previous,
+                'additional_routing_attempt_limit': 32, 'additional_routing_attempts': 0}
+    report['low_contour_fallback'] = fallback
+    report['routing_attempt_limit'] = min(128, previous + 32)
+    try:
+        for frame in frames:
+            try:
+                photo, alpha, canonical, bbox, transform = prepare_subject(source, mask, frame)
+                english = english_layout(config['english'], alpha, bbox, config['seed'], accent)
+                required = transform['geometry']['required_region_source']
+                placement_check = {'head_box_panel': [required[i] * transform['raster_scale'][i % 2] - transform['crop_offset'][i % 2] for i in range(4)], 'margin_pixels': 0}
+                for anchor, anchor_record in fallback_anchor_candidates(alpha, bbox):
+                    try:
+                        lower, japanese, protected, end, candidate = choose_layout(
+                            config, alpha, canonical, bbox, anchor, english, report, accent,
+                            transform['source_edges'], placement_check, extended_budget=True)
+                        report['framing_attempts'].append({'layout_mode': frame['layout_mode'], 'crop_offset': frame['crop_offset'],
+                                                          'anchor': list(anchor), 'result': 'passed', 'stage': 'low-contour-fallback'})
+                        return photo, alpha, canonical, bbox, transform, anchor, anchor_record, english, lower, japanese, protected, end, candidate
+                    except RenderError as exc:
+                        if exc.code != 'NO_SAFE_LAYOUT':
+                            raise
+                        last_error = exc
+                        report.setdefault('anchor_attempts', []).append({'crop_offset': frame['crop_offset'], 'anchor': list(anchor),
+                                                                        'result': exc.code, 'stage': 'low-contour-fallback'})
+                    if report.get('routing_attempt_count', 0) >= report['routing_attempt_limit']:
+                        break
+                raise last_error
+            except RenderError as exc:
+                if exc.code not in ('ENGLISH_DOES_NOT_FIT', 'NO_SAFE_LAYOUT', 'ANCHOR_UNAVAILABLE', 'SUBJECT_TOO_SMALL'):
+                    raise
+                last_error = exc
+                report['framing_attempts'].append({'layout_mode': frame['layout_mode'], 'crop_offset': frame['crop_offset'],
+                                                  'result': exc.code, 'stage': 'low-contour-fallback'})
+            if report.get('routing_attempt_count', 0) >= report['routing_attempt_limit']:
+                break
+        raise last_error
+    finally:
+        fallback['additional_routing_attempts'] = report.get('routing_attempt_count', 0) - previous
 
 
 def render(config, out, report):
